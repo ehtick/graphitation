@@ -1,5 +1,6 @@
 import {
   assertCompositeType,
+  assertNamedType,
   DefinitionNode,
   DocumentNode,
   FieldNode,
@@ -51,6 +52,8 @@ export interface OperationDescriptor<
 
 const TYPENAME_KEY = "__typename";
 
+const GENERATED_FOR_TYPE_KEY = Symbol("The type this data was generated for");
+
 export function generate(
   operation: OperationDescriptor,
   mockResolvers: MockResolvers | null = DEFAULT_MOCK_RESOLVERS
@@ -100,32 +103,69 @@ function visitDocumentDefinitionNode(
         },
       },
       SelectionSet: {
-        enter(selectionSetNode) {
-          if (isAbstractType(typeInfo.getType())) {
-            /**
-             * Only generate data for a single object type.
-             */
-            return reduceToSingleObjectTypeSelection(
-              selectionSetNode,
-              schema,
-              allDocumentDefinitionNodes,
-              typeInfo
-            );
-          }
-        },
+        // enter(selectionSetNode) {
+        //   if (isAbstractType(typeInfo.getType())) {
+        //     /**
+        //      * Only generate data for a single object type.
+        //      */
+        //     return reduceToSingleObjectTypeSelection(
+        //       selectionSetNode,
+        //       schema,
+        //       allDocumentDefinitionNodes,
+        //       typeInfo
+        //     );
+        //   }
+        // },
         leave(selectionSetNode) {
           /**
            * Always add __typename to object types so it's made available in cases
-           * where an abstract parent type had a field selection for it;in which
+           * where an abstract parent type had a field selection for it; in which
            * case it needs an object type name, not the abstract type's name.
            */
           const type = typeInfo.getType();
-          const startWith = isObjectType(type)
-            ? { [TYPENAME_KEY]: type.name }
-            : {};
-          const selections = (selectionSetNode.selections as unknown[]) as MockData[];
+          const startWith = {};
+          // const startWith = isObjectType(type)
+          //   ? { [TYPENAME_KEY]: type.name }
+          //   : {};
+          let selections = (selectionSetNode.selections as unknown[]) as MockData[];
+
+          // console.log(selections);
+          if (isAbstractType(typeInfo.getType())) {
+            let explicitTypename: string | null = null;
+            selections.forEach((selectionSet) => {
+              if (
+                !selectionSet.hasOwnProperty(GENERATED_FOR_TYPE_KEY) &&
+                selectionSet[TYPENAME_KEY]
+              ) {
+                explicitTypename = selectionSet[TYPENAME_KEY] as string;
+              }
+            });
+            console.log({ selections, explicitTypename });
+            // console.log({ nestedSelectionSets });
+            selections = selections.filter((selectionSet) => {
+              if (selectionSet.hasOwnProperty(GENERATED_FOR_TYPE_KEY)) {
+                // When the data is a nested selection set
+                if (selectionSet[GENERATED_FOR_TYPE_KEY] === explicitTypename) {
+                  return true;
+                } else {
+                  return false;
+                }
+              } else {
+                // When the data contains a single scalar field
+                return true;
+              }
+            });
+          }
+
           // TODO: Clean this up
           const data: MockData = startWith;
+
+          // Record the type that this data was generated for so we can use that later on
+          Object.defineProperty(data, GENERATED_FOR_TYPE_KEY, {
+            enumerable: false,
+            value: assertNamedType(typeInfo.getType()).name,
+          });
+
           selections.forEach((selection) => {
             // Only leave an abstract __typename in case there's no other object __typename
             if (
@@ -309,6 +349,7 @@ function mockCompositeType(
   parentType: GraphQLCompositeType,
   resolveValue: ValueResolver
 ): MockData | undefined {
+  // TODO: Coerce arg value to unboxed value
   const args =
     fieldNode.arguments &&
     fieldNode.arguments.reduce(
@@ -325,5 +366,9 @@ function mockCompositeType(
   };
   const data = resolveValue(type.name, context, false, undefined) as MockData;
   // TODO: This is what they do upstream, it doesn't smell right
-  return typeof data === "object" ? data : undefined;
+  if (typeof data === "object") {
+    return data;
+  } else {
+    return undefined;
+  }
 }

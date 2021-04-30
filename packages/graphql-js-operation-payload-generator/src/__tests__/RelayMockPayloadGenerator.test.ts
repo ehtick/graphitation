@@ -26,6 +26,9 @@ const {
   FIXTURE_TAG,
 } = require("relay-test-utils-internal/lib/generateTestsFromFixtures");
 
+console.log(
+  require.resolve("relay-test-utils-internal/lib/testschema.graphql")
+);
 const schema = buildSchema(
   readFileSync(
     require.resolve("relay-test-utils-internal/lib/testschema.graphql"),
@@ -259,8 +262,8 @@ test("generate basic mock data", () => {
   );
 });
 
-xtest("generate mock using custom mock functions", () => {
-  graphql`
+test("generate mock using custom mock functions", () => {
+  const fragment = graphql`
     fragment RelayMockPayloadGeneratorTest7Fragment on User {
       id
       name
@@ -273,9 +276,12 @@ xtest("generate mock using custom mock functions", () => {
     graphql`
       query RelayMockPayloadGeneratorTest7Query {
         node(id: "my-id") {
+          __typename
           ...RelayMockPayloadGeneratorTest7Fragment
+          id
         }
       }
+      ${fragment}
     `,
     {
       ID(context, generateId) {
@@ -290,10 +296,11 @@ xtest("generate mock using custom mock functions", () => {
   );
 });
 
-xtest("generate mock using custom mock functions for object type", () => {
-  graphql`
+test("generate mock using custom mock functions for object type", () => {
+  const fragment = graphql`
     fragment RelayMockPayloadGeneratorTest8Fragment on Page {
       actor {
+        __typename
         id
         name
       }
@@ -307,9 +314,12 @@ xtest("generate mock using custom mock functions for object type", () => {
     graphql`
       query RelayMockPayloadGeneratorTest8Query {
         node(id: "my-id") {
+          __typename
           ...RelayMockPayloadGeneratorTest8Fragment
+          id
         }
       }
+      ${fragment}
     `,
     {
       Image: () => {
@@ -324,9 +334,10 @@ xtest("generate mock using custom mock functions for object type", () => {
 });
 
 xtest("generate mock for objects without concrete type", () => {
-  graphql`
+  const fragment = graphql`
     fragment RelayMockPayloadGeneratorTest9Fragment on Page {
       actor {
+        __typename
         id
         name
       }
@@ -336,9 +347,12 @@ xtest("generate mock for objects without concrete type", () => {
     graphql`
       query RelayMockPayloadGeneratorTest9Query {
         node(id: "my-id") {
+          __typename
           ...RelayMockPayloadGeneratorTest9Fragment
+          id
         }
       }
+      ${fragment}
     `,
     {
       Actor: () => {
@@ -352,7 +366,7 @@ xtest("generate mock for objects without concrete type", () => {
 });
 
 xtest("generate mock using custom mock functions for object type (multiple object)", () => {
-  graphql`
+  const fragment = graphql`
     fragment RelayMockPayloadGeneratorTest10Fragment on User {
       name
       actor {
@@ -377,6 +391,7 @@ xtest("generate mock using custom mock functions for object type (multiple objec
           ...RelayMockPayloadGeneratorTest10Fragment
         }
       }
+      ${fragment}
     `,
     {
       User: () => {
@@ -901,15 +916,17 @@ describe("with @relay_test_operation", () => {
     );
   });
 
-  xtest("generate mock with Mock Resolvers for Interface Type", () => {
+  test("generate mock with Mock Resolvers for Interface Type", () => {
     testGeneratedData(
       graphql`
         query RelayMockPayloadGeneratorTest24Query @relay_test_operation {
           node(id: "my-id") {
+            __typename
             ... on User {
               id
               name
             }
+            id
           }
         }
       `,
@@ -924,19 +941,22 @@ describe("with @relay_test_operation", () => {
     );
   });
 
-  xtest("generate mock with Mock Resolvers for Interface Type with multiple fragment spreads", () => {
+  test.only("generate mock with Mock Resolvers for Interface Type with multiple fragment spreads", () => {
     testGeneratedData(
       graphql`
         query RelayMockPayloadGeneratorTest25Query @relay_test_operation {
           node(id: "my-id") {
+            __typename
             ... on User {
               id
               name
+              actorCount
             }
             ... on Page {
               id
               pageName: name
             }
+            id
           }
         }
       `,
