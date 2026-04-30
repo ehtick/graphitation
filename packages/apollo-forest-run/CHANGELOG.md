@@ -1,8 +1,16 @@
 # Change Log - @graphitation/apollo-forest-run
 
-<!-- This log was last generated on Mon, 13 Apr 2026 14:54:21 GMT and should not be manually modified. -->
+<!-- This log was last generated on Thu, 30 Apr 2026 12:37:52 GMT and should not be manually modified. -->
 
 <!-- Start content -->
+
+## 0.24.0
+
+Thu, 30 Apr 2026 12:37:52 GMT
+
+### Minor changes
+
+- rename conflicting API (pavelglac@gmail.com)
 
 ## 0.23.2
 
