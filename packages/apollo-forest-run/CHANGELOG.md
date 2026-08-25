@@ -1,8 +1,16 @@
 # Change Log - @graphitation/apollo-forest-run
 
-<!-- This log was last generated on Fri, 21 Aug 2026 08:18:48 GMT and should not be manually modified. -->
+<!-- This log was last generated on Tue, 25 Aug 2026 13:33:47 GMT and should not be manually modified. -->
 
 <!-- Start content -->
+
+## 0.25.4
+
+Tue, 25 Aug 2026 13:33:47 GMT
+
+### Patches
+
+- Upgrade js-yaml and brace-expansion in compat lockfile to fix security vulnerabilities (celiac@microsoft.com_msteamsmdb)
 
 ## 0.25.3
 
