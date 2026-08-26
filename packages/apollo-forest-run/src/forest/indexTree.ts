@@ -48,6 +48,7 @@ import {
   isSourceObject,
   markAsPartial,
   resolveFieldValue,
+  resolveListItemChunk,
 } from "../values";
 
 type Context = {
@@ -379,6 +380,14 @@ function reIndexObject(
   const { dataMap, nodes, typeMap } = context;
   dataMap.set(recyclable.data, parent);
 
+  // `incompleteChunks` is per-tree state, so a recycled chunk that is still missing
+  //   fields has to re-register itself - otherwise the incompleteness disappears the
+  //   first time the containing tree is recycled and reads report `complete: true`.
+  if (recyclable.missingFields?.size) {
+    markAsPartial(context, parent);
+    context.incompleteChunks.add(recyclable);
+  }
+
   if (recyclable.type) {
     accumulate(typeMap, recyclable.type, recyclable);
   }
@@ -411,11 +420,29 @@ function reIndexList(
   dataMap.set(recyclable.data, parent);
 
   const itemChunks = recyclable.itemChunks;
+  let reported = false;
   for (let index = 0; index < itemChunks.length; index++) {
-    const itemRef = itemChunks[index];
+    let itemRef = itemChunks[index];
     if (itemRef === undefined) {
-      // A hole means the write that *indexed* this list was malformed. Report that one.
-      assert(false, malformedPayloadError(context, recyclable, parent));
+      if (index >= recyclable.data.length) {
+        // A slot past the end of the data it indexes: the write that *indexed* this
+        //   list was malformed. Report it rather than throwing - a throw would reject
+        //   every later write too, since the hole is cached and each recycle finds it.
+        if (!reported) {
+          reported = true;
+          context.env.logger?.warn(
+            malformedPayloadError(context, recyclable, parent),
+          );
+        }
+        continue;
+      }
+      // `itemChunks` is allocated sparse and filled lazily, so an in-range hole only
+      //   means "not resolved yet".
+      resolveListItemChunk(recyclable, index);
+      itemRef = itemChunks[index];
+      if (itemRef === undefined) {
+        continue;
+      }
     }
     const itemChunk = itemRef.value;
     if (

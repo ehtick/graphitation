@@ -1,4 +1,6 @@
 import { gql } from "../__tests__/helpers/descriptor";
+// The test helper does not support interpolation, so fragments-by-template need the real tag.
+import { gql as gqlWithInterpolation } from "@apollo/client";
 import { ForestRun } from "../ForestRun";
 
 test("properly invalidates nodes added via cache redirects", () => {
@@ -465,52 +467,22 @@ test("properly replaces objects containing nested composite lists", () => {
 });
 
 // Regression coverage for `TypeError: Cannot read properties of undefined (reading 'value')`
-// thrown by reIndexList (src/forest/indexTree.ts). Everything below goes through
-// the public cache API only.
+// thrown by reIndexList (src/forest/indexTree.ts), through the public cache API only.
 //
 // The crash needed a four way conjunction:
-//  1. The same node (Thread:1) is selected twice in one operation with two
-//     *different* selections. aggregateFieldChunks only dedupes chunks sharing
-//     both selection and operation, so here the node value stays an aggregate.
-//  2. The two selections carry lists of different lengths (14 vs 3) and the
-//     aggregate iterates the longer one.
-//  3. The longer list starts with nulls. diffCompositeListLayout pushes `null`
-//     into the layout for them and diffCompositeListValue skips those indices
-//     (`baseItemIndex` is not a number), so index 4 is the *first* index
-//     resolved against the aggregate.
-//  4. aggregateListItemValue -> resolveListItemChunk assigns `itemChunks[4]` on
-//     the 3 item chunk with no bounds check. The array grows past its data
-//     length and index 3 is left unresolved.
+//  1. One node (Thread:1) selected twice in one operation under *different* selections.
+//  2. The two selections carry lists of different lengths (14 vs 3).
+//  3. The longer list starts with nulls, which the diff skips, so index 4 is resolved first.
+//  4. resolveListItemChunk assigned `itemChunks[4]` on the 3 item chunk unchecked.
 //
-// Only the *first* out of range index decides whether a hole is left: resolving in
-// ascending order grows the short chunk densely. Leading nulls are the cheapest way
-// to start above its length, not the only one - `layout` is a key lookup
-// (findKeyIndex), so a reordered keyed list visits base indices out of order too,
-// and descendToChunk/retrieveEmbeddedValue resolve a single index with no scan.
+// Nothing read the resulting hole until a *later* write recycled that chunk, which is why
+// the trace blamed an innocent write - and why every write after it was rejected too.
 //
-// Steps 1+2 are the actual defect in the payload, but nothing reads the hole it
-// leaves until a *later* write recycles that chunk - which is why the stack trace
-// blames a write that is entirely innocent. reIndexList now detects the hole
-// instead of dereferencing it, and reports what is known about the damaged list.
-const seedQuery = gql`
-  query MessageListSeed {
-    thread {
-      __typename
-      id
-      messages {
-        __typename
-        id
-        text
-      }
-    }
-  }
-`;
-
-const messageListQuery = gql`
-  query MessageList {
-    conversation {
-      __typename
-      id
+// resolveListItemChunk now returns an uncached undefined chunk when out of range, so no hole
+// is created and the node keeps the last of the divergent values written.
+describe("malformed payloads repeating a node with divergent list lengths", () => {
+  const seedQuery = gql`
+    query MessageListSeed {
       thread {
         __typename
         id
@@ -521,339 +493,470 @@ const messageListQuery = gql`
         }
       }
     }
-    pinned {
-      __typename
-      id
-      thread {
+  `;
+
+  const messageListQuery = gql`
+    query MessageList {
+      conversation {
         __typename
         id
-        title
+        thread {
+          __typename
+          id
+          messages {
+            __typename
+            id
+            text
+          }
+        }
+      }
+      pinned {
+        __typename
+        id
+        thread {
+          __typename
+          id
+          title
+          messages {
+            __typename
+            id
+            text
+            author {
+              __typename
+              id
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const messageIds = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+  const message = (id: string) => ({ __typename: "Message", id, text: id });
+  const pinnedMessage = (id: string) => ({
+    ...message(id),
+    author: { __typename: "User", id: "1" },
+  });
+  const conversation = (messages: unknown[]) => ({
+    __typename: "Conversation",
+    id: "1",
+    thread: { __typename: "Thread", id: "1", messages },
+  });
+  const createPinned = (ids: string[] = ["1", "2", "3"]) => ({
+    __typename: "Pinned",
+    id: "1",
+    thread: {
+      __typename: "Thread",
+      id: "1",
+      title: "Pinned",
+      messages: ids.map(pinnedMessage),
+    },
+  });
+
+  const seedThread = (cache: ForestRun) =>
+    cache.write({
+      query: seedQuery,
+      result: {
+        thread: {
+          __typename: "Thread",
+          id: "1",
+          messages: messageIds.map(message),
+        },
+      },
+    });
+
+  // Without the leading nulls the same payload grows the 3 item chunk densely and
+  // leaves no hole behind, so this exact shape is what the check can see.
+  const conversationMessages = [
+    null,
+    null,
+    null,
+    null,
+    ...messageIds.map(message),
+  ];
+
+  // Thread:1 is one node, so both occurrences resolve to the same list.
+  const readMessageTexts = (cache: ForestRun) => {
+    const result = cache.readQuery<any>({
+      query: seedQuery,
+      returnPartialData: true,
+    });
+    return result?.thread?.messages?.map((m: any) => m?.text ?? null);
+  };
+
+  test("keeps accepting writes after the malformed payload", () => {
+    const cache = new ForestRun();
+    seedThread(cache);
+
+    // Thread:1 appears twice: 14 messages under `conversation`, 3 under `pinned`.
+    const pinned = createPinned();
+    cache.write({
+      query: messageListQuery,
+      result: { conversation: conversation(conversationMessages), pinned },
+    });
+
+    // Reusing the same source objects makes indexTree recycle that subtree, and recycling
+    // walks every item reference. This is the write that used to throw.
+    expect(() =>
+      cache.write({
+        query: messageListQuery,
+        result: { conversation: conversation(conversationMessages), pinned },
+      }),
+    ).not.toThrow();
+
+    // Rejection was never a one off - the cached hole failed every later write too. Fresh
+    // data now lands, and the node keeps the last of the two divergent lists written.
+    cache.write({
+      query: messageListQuery,
+      result: {
+        conversation: conversation(
+          conversationMessages.map((m) =>
+            m ? { ...m, text: `next-${m.id}` } : m,
+          ),
+        ),
+        pinned,
+      },
+    });
+    expect(readMessageTexts(cache)).toEqual([
+      null,
+      null,
+      null,
+      null,
+      ...messageIds.map((id) => `next-${id}`),
+    ]);
+
+    // A well formed payload still restores both occurrences.
+    cache.write({
+      query: messageListQuery,
+      result: {
+        conversation: conversation(messageIds.map(message)),
+        pinned: createPinned(messageIds),
+      },
+    });
+    expect(readMessageTexts(cache)).toEqual(messageIds);
+  });
+
+  test("accepts a repeated node whose lists are of equal length", () => {
+    const cache = new ForestRun();
+    seedThread(cache);
+
+    // Thread:1 still appears twice under two different selections (`pinned` also
+    // selects `title` and `author`), which is legal as long as the shared list
+    // field resolves to the same items. Guards the check against over rejecting.
+    const pinned = createPinned(messageIds);
+
+    cache.write({
+      query: messageListQuery,
+      result: {
+        conversation: conversation(messageIds.map(message)),
+        pinned,
+      },
+    });
+
+    // Reusing the same `pinned` source object makes indexTree recycle that subtree, which
+    // walks every item reference. Both lists keep the same length, only the text changes.
+    expect(() =>
+      cache.write({
+        query: messageListQuery,
+        result: {
+          conversation: conversation(
+            messageIds.map((id) => ({ ...message(id), text: `${id} edited` })),
+          ),
+          pinned,
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  // The same defect one level deeper: the repeated node is a list *item*, so both occurrences
+  // carry a list index and the error has to address them by index. They use different
+  // selections only because aggregateFieldChunks would otherwise collapse them before
+  // their lists are aggregated - a constraint on the test, not on the defect.
+  const fileNode = (id: string) => ({ __typename: "File", id });
+  const messageWithFiles = (id: string, files: unknown[]) => ({
+    __typename: "Message",
+    id,
+    files,
+  });
+
+  const attachmentSeedQuery = gql`
+    query AttachmentSeed {
+      message {
+        __typename
+        id
+        files {
+          __typename
+          id
+        }
+      }
+    }
+  `;
+
+  const attachmentQuery = gql`
+    query Attachments {
+      inbox {
+        __typename
+        id
         messages {
           __typename
           id
-          text
-          author {
+          files {
+            __typename
+            id
+          }
+        }
+      }
+      starred {
+        __typename
+        id
+        messages {
+          __typename
+          id
+          subject
+          files {
             __typename
             id
           }
         }
       }
     }
-  }
-`;
+  `;
 
-const messageIds = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
-const message = (id: string) => ({ __typename: "Message", id, text: id });
-const pinnedMessage = (id: string) => ({
-  ...message(id),
-  author: { __typename: "User", id: "1" },
-});
-const conversation = (messages: unknown[]) => ({
-  __typename: "Conversation",
-  id: "1",
-  thread: { __typename: "Thread", id: "1", messages },
-});
-const createPinned = (ids: string[] = ["1", "2", "3"]) => ({
-  __typename: "Pinned",
-  id: "1",
-  thread: {
-    __typename: "Thread",
-    id: "1",
-    title: "Pinned",
-    messages: ids.map(pinnedMessage),
-  },
-});
-
-const seedThread = (cache: ForestRun) =>
-  cache.write({
-    query: seedQuery,
-    result: {
-      thread: {
-        __typename: "Thread",
-        id: "1",
-        messages: messageIds.map(message),
-      },
-    },
-  });
-
-// Without the leading nulls the same payload grows the 3 item chunk densely and
-// leaves no hole behind, so this exact shape is what the check can see.
-const conversationMessages = [
-  null,
-  null,
-  null,
-  null,
-  ...messageIds.map(message),
-];
-
-test("reports an unresolved list item instead of dereferencing it", () => {
-  const cache = new ForestRun();
-  seedThread(cache);
-
-  // Thread:1 appears twice: 14 messages under `conversation`, 3 under `pinned`.
-  // This write punches the hole and is accepted - nothing reads it yet.
-  const pinned = createPinned();
-  cache.write({
-    query: messageListQuery,
-    result: { conversation: conversation(conversationMessages), pinned },
-  });
-
-  // Reusing the same source objects makes indexTree recycle the damaged subtree
-  // instead of indexing it again, and recycling walks every item reference.
-  let error: Error | undefined;
-  try {
+  test("keeps accepting writes when the repeated node is itself a list item", () => {
+    const cache = new ForestRun();
     cache.write({
-      query: messageListQuery,
-      result: { conversation: conversation(conversationMessages), pinned },
-    });
-  } catch (e) {
-    error = e as Error;
-  }
-
-  expect(error?.message).toMatch(
-    /^Invariant violation: Detected malformed payload written to the cache/,
-  );
-  // This phrase is the first thing a human reads in a telemetry dashboard, so keep it
-  // stable across rewordings of the rest.
-  expect(error?.message).toContain(
-    'a "Thread" node occurs multiple times in a single write with a different ' +
-      'number of items in the "messages" list',
-  );
-  // The write being recycled is the one that produced the malformed payload. Recycling is
-  // always same-operation, so there is no second operation to name.
-  expect(error?.message).toContain("Operation:  query MessageList");
-  expect(error?.message).toContain("Node type:  Thread");
-  // Both occurrences are the same entity - that is what makes the divergence a conflict -
-  // but the id itself must not leak, so the message states the fact without printing it.
-  expect(error?.message).toContain(
-    "Node id:    same in both occurrences (not shown)",
-  );
-  expect(error?.message).toContain("Field:      messages");
-  // Both conflicting occurrences, reconstructed from the tree being recycled.
-  expect(error?.message).toContain(
-    "Occurrence 1: 14 items at data.conversation.thread.messages",
-  );
-  expect(error?.message).toContain(
-    "Occurrence 2: 3 items at data.pinned.thread.messages",
-  );
-  expect(error?.message).not.toContain("Thread:1");
-});
-
-test("accepts a payload repeating a node with lists of equal length", () => {
-  const cache = new ForestRun();
-  seedThread(cache);
-
-  // Thread:1 still appears twice under two different selections (`pinned` also
-  // selects `title` and `author`), which is legal as long as the shared list
-  // field resolves to the same items. Guards the check against over rejecting.
-  const pinned = createPinned(messageIds);
-
-  cache.write({
-    query: messageListQuery,
-    result: {
-      conversation: conversation(messageIds.map(message)),
-      pinned,
-    },
-  });
-
-  // Reusing the same `pinned` source object makes indexTree recycle that subtree
-  // instead of indexing it again: reIndexObject -> reIndexObject -> reIndexList,
-  // which walks every item reference of the list. Both lists keep the same
-  // length, only the message text changes.
-  expect(() =>
-    cache.write({
-      query: messageListQuery,
+      query: attachmentSeedQuery,
       result: {
-        conversation: conversation(
-          messageIds.map((id) => ({ ...message(id), text: `${id} edited` })),
-        ),
-        pinned,
+        message: messageWithFiles("7", [fileNode("a"), fileNode("b")]),
       },
-    }),
-  ).not.toThrow();
-});
+    });
 
-// The same defect one level deeper: the repeated node is a list *item* rather than
-// a field of the root, and the divergent list hangs off it. Both occurrences carry
-// a list index, which is what this pins - the error has to address them by index.
-//
-// The two occurrences use different selections because that is what the indexing
-// path needs: aggregateFieldChunks drops adjacent chunks sharing selection and
-// operation, so a node repeated under one selection is collapsed before its lists
-// are aggregated. Other routes into resolveListItemChunk do not go through that
-// dedupe, so this is a constraint on the test, not on the defect.
-const fileNode = (id: string) => ({ __typename: "File", id });
-const messageWithFiles = (id: string, files: unknown[]) => ({
-  __typename: "Message",
-  id,
-  files,
-});
+    // Message:7 is at index 2 of `inbox.messages` with 4 files and at index 1 of
+    // `starred.messages` with 1. Only the subtree holding the shorter list keeps
+    // its identity, so it is the one recycled by the second write.
+    const starred = {
+      __typename: "Starred",
+      id: "1",
+      messages: [
+        { ...messageWithFiles("3", []), subject: "s" },
+        { ...messageWithFiles("7", [fileNode("a")]), subject: "s" },
+      ],
+    };
+    const inbox = () => ({
+      __typename: "Inbox",
+      id: "1",
+      messages: [
+        messageWithFiles("1", []),
+        messageWithFiles("2", []),
+        messageWithFiles("7", [null, null, fileNode("a"), fileNode("b")]),
+      ],
+    });
 
-const attachmentSeedQuery = gql`
-  query AttachmentSeed {
-    message {
-      __typename
-      id
-      files {
-        __typename
-        id
-      }
-    }
-  }
-`;
-
-const attachmentQuery = gql`
-  query Attachments {
-    inbox {
-      __typename
-      id
-      messages {
-        __typename
-        id
-        files {
-          __typename
-          id
-        }
-      }
-    }
-    starred {
-      __typename
-      id
-      messages {
-        __typename
-        id
-        subject
-        files {
-          __typename
-          id
-        }
-      }
-    }
-  }
-`;
-
-test("reports list indices when the repeated node is itself a list item", () => {
-  const cache = new ForestRun();
-  cache.write({
-    query: attachmentSeedQuery,
-    result: {
-      message: messageWithFiles("7", [fileNode("a"), fileNode("b")]),
-    },
-  });
-
-  // Message:7 is at index 2 of `inbox.messages` with 4 files and at index 1 of
-  // `starred.messages` with 1. Only the subtree holding the shorter list keeps
-  // its identity, so it is the one recycled by the second write.
-  const starred = {
-    __typename: "Starred",
-    id: "1",
-    messages: [
-      { ...messageWithFiles("3", []), subject: "s" },
-      { ...messageWithFiles("7", [fileNode("a")]), subject: "s" },
-    ],
-  };
-  const inbox = () => ({
-    __typename: "Inbox",
-    id: "1",
-    messages: [
-      messageWithFiles("1", []),
-      messageWithFiles("2", []),
-      messageWithFiles("7", [null, null, fileNode("a"), fileNode("b")]),
-    ],
-  });
-
-  cache.write({
-    query: attachmentQuery,
-    result: { inbox: inbox(), starred },
-  });
-
-  let error: Error | undefined;
-  try {
     cache.write({
       query: attachmentQuery,
       result: { inbox: inbox(), starred },
     });
-  } catch (e) {
-    error = e as Error;
+
+    expect(() =>
+      cache.write({
+        query: attachmentQuery,
+        result: { inbox: inbox(), starred },
+      }),
+    ).not.toThrow();
+
+    // Message:7 still reads back, keeping the last of the two divergent lists written.
+    const result = cache.readQuery<any>({
+      query: attachmentSeedQuery,
+      returnPartialData: true,
+    });
+    expect(result?.message?.id).toBe("7");
+    expect(result?.message?.files?.map((f: any) => f?.id ?? null)).toEqual([
+      null,
+      null,
+      "a",
+      "b",
+    ]);
+  });
+
+  // The same defect, benign symptom: resolving every out of bounds index in order densifies
+  // the shorter chunk instead of leaving a hole, so reIndexList never tripped even though the
+  // cache state is just as wrong. Neither variant is *rejected*; validating the payload at
+  // index time is a follow up.
+  test.todo("rejects repeated nodes with divergent list lengths at index time");
+
+  // Both tests above hang the divergent list directly off the repeated *node*. Production hit
+  // a shape neither covers: the list belongs to an embedded, keyless connection nested under
+  // the repeated node, which reaches resolveListItemChunk the same way.
+  const participantEdge = (id: string) => ({
+    __typename: "ParticipantEdge",
+    cursor: id,
+    node: { __typename: "User", id },
+  });
+
+  const threadSummary = (edges: unknown[]) => ({
+    __typename: "ThreadSummary",
+    participants: {
+      __typename: "ParticipantConnection",
+      edges,
+    },
+  });
+
+  const summarizedMessage = (id: string, edges: unknown[]) => ({
+    __typename: "Message",
+    id,
+    threadSummary: threadSummary(edges),
+  });
+
+  const summarySeedQuery = gql`
+    query SummarySeed {
+      message {
+        __typename
+        id
+        threadSummary {
+          __typename
+          participants {
+            __typename
+            edges {
+              __typename
+              cursor
+              node {
+                __typename
+                id
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  // `lastMessage` is selected before `messages`, so its 4 item chunk is aggregated first and
+  // the out of range indices are applied to the 0 item chunk at `messages.0`. Its extra
+  // `subject` field is only there to keep the two selections from being collapsed.
+  const messageFeedQuery = gql`
+    query MessageFeed {
+      feed {
+        __typename
+        id
+        lastMessage {
+          __typename
+          id
+          subject
+          threadSummary {
+            __typename
+            participants {
+              __typename
+              edges {
+                __typename
+                cursor
+                node {
+                  __typename
+                  id
+                }
+              }
+            }
+          }
+        }
+        messages {
+          __typename
+          id
+          threadSummary {
+            __typename
+            participants {
+              __typename
+              edges {
+                __typename
+                cursor
+                node {
+                  __typename
+                  id
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  function writeDivergentConnection(): ForestRun {
+    // Keyed edges are required: with keyless items diffCompositeListLayout falls through to
+    // the item loop, which resolves every index in order and densifies the short chunk
+    // instead of leaving a hole.
+    const cache = new ForestRun({
+      typePolicies: {
+        ParticipantEdge: { keyFields: ["cursor"] },
+      },
+    });
+    cache.write({
+      query: summarySeedQuery,
+      result: {
+        message: summarizedMessage("7", [
+          participantEdge("a"),
+          participantEdge("b"),
+        ]),
+      },
+    });
+
+    // Message:7 twice in one payload: 4 edges under `lastMessage`, 0 under `messages.0`.
+    const feed = {
+      __typename: "Feed",
+      id: "1",
+      lastMessage: {
+        ...summarizedMessage("7", [
+          null,
+          null,
+          participantEdge("a"),
+          participantEdge("b"),
+        ]),
+        subject: "s",
+      },
+      messages: [summarizedMessage("7", [])],
+    };
+
+    // The second write recycles the subtree left by the first, which is where the hole
+    // used to be dereferenced.
+    cache.write({ query: messageFeedQuery, result: { feed } });
+    cache.write({ query: messageFeedQuery, result: { feed } });
+    return cache;
   }
 
-  expect(error?.message).toContain(
-    'a "Message" node occurs multiple times in a single write with a different ' +
-      'number of items in the "files" list',
-  );
-  expect(error?.message).toContain("Node type:  Message");
-  expect(error?.message).toContain("Field:      files");
-  // Each occurrence is addressed by its index in the enclosing list, and a single
-  // item reads as "1 item" rather than "1 items".
-  expect(error?.message).toContain(
-    "Occurrence 1: 4 items at data.inbox.messages.2.files",
-  );
-  expect(error?.message).toContain(
-    "Occurrence 2: 1 item at data.starred.messages.1.files",
-  );
-  expect(error?.message).not.toContain("Message:7");
-});
+  test("accepts a divergent list belonging to an embedded object", () => {
+    expect(() => writeDivergentConnection()).not.toThrow();
 
-// The same defect, benign symptom: when every out of bounds index is resolved in
-// order the shorter chunk densifies instead of growing a hole, so there is
-// nothing for reIndexList to trip over even though the cache state is just as
-// wrong. Catching that needs the payload itself to be validated while it is
-// indexed, which is a follow up.
-test.todo("rejects repeated nodes with divergent list lengths at index time");
+    // `edges` is declared by the connection rather than by Message:7, so this covers
+    // resolving out of range indices through an embedded, keyless owner.
+    const cache = writeDivergentConnection();
+    const result = cache.readQuery<any>({
+      query: summarySeedQuery,
+      returnPartialData: true,
+    });
+    expect(result?.message?.id).toBe("7");
+    expect(
+      result?.message?.threadSummary?.participants?.edges?.map(
+        (e: any) => e?.cursor ?? null,
+      ),
+    ).toEqual([null, null, "a", "b"]);
+  });
 
-// Both tests above have the divergent list hanging directly off the repeated *node*
-// (`Thread.messages`, `Message.files`). Production hit a shape neither covers: the list
-// belongs to an embedded, keyless object (a Relay connection) nested under the repeated
-// node - `Message.threadSummary.participants.edges`.
-//
-// `findOccurrences` used to key its search on the object owning the list field:
-//
-//     const key = owner?.parent.key;
-//     if (tree && fieldEntry && typeof key === "string") { ...search siblings... }
-//
-// A connection has no id, so its chunk key is `false`, the search was skipped, `found`
-// stayed empty and only the damaged chunk was reported - under a `Node type` naming the
-// connection, which is not a node and cannot be repeated:
-//
-//   ... a "ParticipantConnection" node occurs multiple times in a single write with a
-//   different number of items in the "edges" list.
-//     Operation:  query MessageFeed
-//     Node type:  ParticipantConnection
-//     Field:      edges
-//     Occurrence 1: 0 items at data.feed.messages.0.threadSummary.participants.edges
-//
-// The missing "Node id" line - printed only when two occurrences are found - is what
-// identified that as under-reporting rather than truncation in the telemetry pipeline.
-// The search now climbs to the enclosing `Message` and descends the embedded path, and
-// reporting has two branches: the list is a field of the node (`Node type`), or a field of
-// an object embedded under it (`Object type` + `Parent node type`).
-const participantEdge = (id: string) => ({
-  __typename: "ParticipantEdge",
-  cursor: id,
-  node: { __typename: "User", id },
-});
+  // The repeat need not be a repeated *message*: when the summary carries its own id, two
+  // different messages pointing at it repeat that node, so one plain list of messages suffices.
+  // The two chunks survive aggregateFieldChunks because `replyTo.threadSummary` and
+  // `threadSummary` are separate selection sets.
+  const keyedSummary = (id: string, edges: unknown[]) => ({
+    __typename: "ThreadSummary",
+    id,
+    participants: {
+      __typename: "ParticipantConnection",
+      edges,
+    },
+  });
 
-const threadSummary = (edges: unknown[]) => ({
-  __typename: "ThreadSummary",
-  participants: {
-    __typename: "ParticipantConnection",
-    edges,
-  },
-});
-
-const summarizedMessage = (id: string, edges: unknown[]) => ({
-  __typename: "Message",
-  id,
-  threadSummary: threadSummary(edges),
-});
-
-const summarySeedQuery = gql`
-  query SummarySeed {
-    message {
-      __typename
-      id
-      threadSummary {
+  const keyedSummarySeedQuery = gql`
+    query KeyedSummarySeed {
+      summary {
         __typename
+        id
         participants {
           __typename
           edges {
@@ -867,194 +970,35 @@ const summarySeedQuery = gql`
         }
       }
     }
-  }
-`;
+  `;
 
-// `lastMessage` is selected before `messages`, so its 4 item chunk is aggregated first and
-// the out of range indices are applied to the 0 item chunk at `messages.0`. Its extra
-// `subject` field is what makes the two selections differ: aggregateFieldChunks drops
-// adjacent chunks sharing a selection and operation, so without it the repeat is collapsed
-// before the lists are aggregated and nothing diverges.
-const messageFeedQuery = gql`
-  query MessageFeed {
-    feed {
-      __typename
-      id
-      lastMessage {
+  const messageThreadsQuery = gql`
+    query MessageThreads {
+      feed {
         __typename
         id
-        subject
-        threadSummary {
-          __typename
-          participants {
-            __typename
-            edges {
-              __typename
-              cursor
-              node {
-                __typename
-                id
-              }
-            }
-          }
-        }
-      }
-      messages {
-        __typename
-        id
-        threadSummary {
-          __typename
-          participants {
-            __typename
-            edges {
-              __typename
-              cursor
-              node {
-                __typename
-                id
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-`;
-
-function writeDivergentConnection(): Error | undefined {
-  // Keyed edges are required: with keyless items diffCompositeListLayout falls through to
-  // the item loop, which resolves every index in order and densifies the short chunk
-  // instead of leaving a hole.
-  const cache = new ForestRun({
-    typePolicies: {
-      ParticipantEdge: { keyFields: ["cursor"] },
-    },
-  });
-  cache.write({
-    query: summarySeedQuery,
-    result: {
-      message: summarizedMessage("7", [
-        participantEdge("a"),
-        participantEdge("b"),
-      ]),
-    },
-  });
-
-  // Message:7 twice in one payload: 4 edges under `lastMessage`, 0 under `messages.0`.
-  const feed = {
-    __typename: "Feed",
-    id: "1",
-    lastMessage: {
-      ...summarizedMessage("7", [
-        null,
-        null,
-        participantEdge("a"),
-        participantEdge("b"),
-      ]),
-      subject: "s",
-    },
-    messages: [summarizedMessage("7", [])],
-  };
-
-  try {
-    // First write punches the hole and is accepted; the second recycles the subtree.
-    cache.write({ query: messageFeedQuery, result: { feed } });
-    cache.write({ query: messageFeedQuery, result: { feed } });
-  } catch (e) {
-    return e as Error;
-  }
-  return undefined;
-}
-
-test("reports both occurrences when the divergent list belongs to an embedded object", () => {
-  const error = writeDivergentConnection();
-
-  // Occurrences are addressed in payload order, so the conflicting one comes first here.
-  // It is the half that explains the divergence, and the half that used to be missing:
-  // `findOccurrences` searched by the key of the *connection*, which is `false`.
-  expect(error?.message).toContain(
-    "Occurrence 1: 4 items at data.feed.lastMessage.threadSummary.participants.edges",
-  );
-  // The damaged (empty) occurrence - the one being recycled when the hole is hit.
-  expect(error?.message).toContain(
-    "Occurrence 2: 0 items at data.feed.messages.0.threadSummary.participants.edges" +
-      " (4 slots, holes at 0,1)",
-  );
-  // Printed only when two occurrences are found, so it tracks the assertions above.
-  expect(error?.message).toContain(
-    "Parent node id:    same in both occurrences (not shown)",
-  );
-  expect(error?.message).not.toContain("Message:7");
-});
-
-test("names the node behind a divergent list of an embedded object", () => {
-  const error = writeDivergentConnection();
-
-  // `edges` is declared by the connection, so that is the type named next to it - saying
-  // "Message" there would point at a type with no such field.
-  expect(error?.message).toContain("Object type:       ParticipantConnection");
-  expect(error?.message).toContain("Field:             edges");
-  // The connection has no id and cannot be repeated on its own: the node occurring twice
-  // is the enclosing Message, and the path says where the connection hangs off it.
-  expect(error?.message).toContain("Parent node type:  Message");
-  expect(error?.message).toContain(
-    "Path in node:      threadSummary.participants.edges",
-  );
-  expect(error?.message).toContain(
-    'a "ParticipantConnection" object embedded in a "Message" node occurs multiple ' +
-      'times in a single write with a different number of items in the "edges" list',
-  );
-});
-
-// Nothing above requires the repeat to be visible in the payload as a repeated *message*.
-// When the summary carries its own id, two different messages pointing at the same summary
-// repeat that node instead - so a query selecting one plain list of messages is enough, and
-// the two occurrences sit at two items of that single list.
-//
-// The two summary chunks survive `aggregateFieldChunks` because `replyTo.threadSummary` and
-// `threadSummary` are separate selection sets: chunks are only collapsed when adjacent and
-// sharing both selection and operation, which is what happens when every item of a list
-// reaches the same node through the same path.
-const keyedSummary = (id: string, edges: unknown[]) => ({
-  __typename: "ThreadSummary",
-  id,
-  participants: {
-    __typename: "ParticipantConnection",
-    edges,
-  },
-});
-
-const keyedSummarySeedQuery = gql`
-  query KeyedSummarySeed {
-    summary {
-      __typename
-      id
-      participants {
-        __typename
-        edges {
-          __typename
-          cursor
-          node {
-            __typename
-            id
-          }
-        }
-      }
-    }
-  }
-`;
-
-const messageThreadsQuery = gql`
-  query MessageThreads {
-    feed {
-      __typename
-      id
-      messages {
-        __typename
-        id
-        replyTo {
+        messages {
           __typename
           id
+          replyTo {
+            __typename
+            id
+            threadSummary {
+              __typename
+              id
+              participants {
+                __typename
+                edges {
+                  __typename
+                  cursor
+                  node {
+                    __typename
+                    id
+                  }
+                }
+              }
+            }
+          }
           threadSummary {
             __typename
             id
@@ -1071,40 +1015,13 @@ const messageThreadsQuery = gql`
             }
           }
         }
-        threadSummary {
-          __typename
-          id
-          participants {
-            __typename
-            edges {
-              __typename
-              cursor
-              node {
-                __typename
-                id
-              }
-            }
-          }
-        }
       }
     }
-  }
-`;
-
-test("reports a node repeated across items of a single list", () => {
-  const cache = new ForestRun({
-    typePolicies: { ParticipantEdge: { keyFields: ["cursor"] } },
-  });
-  cache.write({
-    query: keyedSummarySeedQuery,
-    result: {
-      summary: keyedSummary("x", [participantEdge("a"), participantEdge("b")]),
-    },
-  });
+  `;
 
   // ThreadSummary:x twice, under two different messages of the same list: 4 participants
   // below `messages.0.replyTo`, 0 below `messages.1`.
-  const feed = {
+  const divergentFeed = () => ({
     __typename: "Feed",
     id: "1",
     messages: [
@@ -1130,26 +1047,176 @@ test("reports a node repeated across items of a single list", () => {
         threadSummary: keyedSummary("x", []),
       },
     ],
-  };
+  });
 
-  let error: Error | undefined;
-  try {
-    cache.write({ query: messageThreadsQuery, result: { feed } });
-    cache.write({ query: messageThreadsQuery, result: { feed } });
-  } catch (e) {
-    error = e as Error;
+  function seedKeyedSummary() {
+    const cache = new ForestRun({
+      typePolicies: { ParticipantEdge: { keyFields: ["cursor"] } },
+    });
+    cache.write({
+      query: keyedSummarySeedQuery,
+      result: {
+        summary: keyedSummary("x", [
+          participantEdge("a"),
+          participantEdge("b"),
+        ]),
+      },
+    });
+    return cache;
   }
 
-  // The messages differ, so the repeat is only visible once the summary is named.
-  expect(error?.message).toContain("Parent node type:  ThreadSummary");
-  expect(error?.message).toContain("Object type:       ParticipantConnection");
-  expect(error?.message).toContain(
-    "Occurrence 1: 4 items at data.feed.messages.0.replyTo.threadSummary.participants.edges",
-  );
-  expect(error?.message).toContain(
-    "Occurrence 2: 0 items at data.feed.messages.1.threadSummary.participants.edges",
-  );
-  expect(error?.message).not.toContain("ThreadSummary:x");
+  const readCursors = (cache: ForestRun) =>
+    cache
+      .readQuery<any>({ query: keyedSummarySeedQuery, returnPartialData: true })
+      ?.summary?.participants?.edges?.map((e: any) => e?.cursor ?? null);
+
+  test("keeps accepting writes when a node is repeated across items of a single list", () => {
+    const cache = seedKeyedSummary();
+    const feed = divergentFeed();
+
+    cache.write({ query: messageThreadsQuery, result: { feed } });
+    expect(() =>
+      cache.write({ query: messageThreadsQuery, result: { feed } }),
+    ).not.toThrow();
+
+    expect(readCursors(cache)).toEqual([null, null, "a", "b"]);
+  });
+
+  // The shape behind the production report. Reads hand back the payload arrays themselves,
+  // so a caller mutating one writes straight into the tree, past any reconciliation. On top
+  // of a cached hole that used to freeze the operation on its pre-divergence state.
+  test("recovers once a well formed payload arrives, even after a caller mutates a read result", () => {
+    const cache = seedKeyedSummary();
+    cache.write({
+      query: messageThreadsQuery,
+      result: { feed: divergentFeed() },
+    });
+
+    const { result } = cache.diff<any>({
+      query: messageThreadsQuery,
+      optimistic: false,
+    });
+    result.feed.messages[0].replyTo.threadSummary.participants.edges.length = 0;
+
+    const healthy = [
+      participantEdge("a"),
+      participantEdge("b"),
+      participantEdge("c"),
+    ];
+    expect(() =>
+      cache.write({
+        query: keyedSummarySeedQuery,
+        result: { summary: keyedSummary("x", healthy) },
+      }),
+    ).not.toThrow();
+
+    expect(readCursors(cache)).toEqual(["a", "b", "c"]);
+  });
+});
+
+// A separate defect, present on main independently of the one above: `incompleteChunks` is
+// per-tree state, so a recycled chunk that is still missing fields has to re-register itself.
+// When it did not, the incompleteness disappeared the first time a write recycled the tree
+// and later reads served placeholders as if they were real data.
+describe("incompleteness across recycling", () => {
+  const participantFields = `
+    __typename
+    summary {
+      __typename
+      participants {
+        __typename
+        edges {
+          __typename
+          cursor
+          node { __typename id }
+        }
+      }
+    }
+  `;
+
+  const feedQuery = gqlWithInterpolation`
+    query IncompleteFeed {
+      feed {
+        __typename
+        id
+        lastMessage { id subject ${participantFields} }
+        messages { id ${participantFields} }
+      }
+    }
+  `;
+
+  const messageQuery = gqlWithInterpolation`
+    query IncompleteMessageById {
+      message { id ${participantFields} }
+    }
+  `;
+
+  const edge = (cursor: string) => ({
+    __typename: "ParticipantEdge",
+    cursor,
+    node: { __typename: "User", id: cursor },
+  });
+
+  const message = (edges: unknown[]) => ({
+    __typename: "Message",
+    id: "message-1",
+    summary: {
+      __typename: "ThreadSummary",
+      participants: { __typename: "ParticipantConnection", edges },
+    },
+  });
+
+  const feed = (lastMessageEdges: unknown[], messageEdges: unknown[]) => ({
+    feed: {
+      __typename: "Feed",
+      id: "feed-1",
+      lastMessage: { ...message(lastMessageEdges), subject: "subject" },
+      messages: [message(messageEdges)],
+    },
+  });
+
+  const cursorsOf = (result: unknown) =>
+    (result as any)?.feed?.messages?.[0]?.summary?.participants?.edges?.map(
+      (e: any) => e?.cursor,
+    );
+
+  it("does not serve placeholder objects after a divergent chunk is recycled", () => {
+    const cache = new ForestRun({
+      typePolicies: { ParticipantEdge: { keyFields: ["cursor"] } },
+    });
+
+    // A single malformed payload: the same node appears twice with different list
+    // lengths, so the shorter chunk gets padded with placeholders.
+    cache.write({
+      query: feedQuery,
+      result: feed([edge("a"), edge("b"), edge("c"), edge("d")], []),
+    });
+
+    // Grow, then shrink the same node through another operation. The second write
+    // recycles the tree produced by the first.
+    cache.write({
+      query: messageQuery,
+      result: {
+        message: message([
+          edge("a"),
+          edge("b"),
+          edge("c"),
+          edge("d"),
+          edge("e"),
+        ]),
+      },
+    });
+    cache.write({
+      query: messageQuery,
+      result: { message: message([edge("a"), edge("b"), edge("c")]) },
+    });
+
+    const diff = cache.diff({ query: feedQuery, optimistic: false });
+
+    // Before the fix this returned `[{}, {}, {}]` - three objects with no fields -
+    // while still reporting `complete: true`.
+    expect(cursorsOf(diff.result)).toEqual(["a", "b", "c"]);
+  });
 });
 
 test("properly reads plain objects from nested lists", () => {

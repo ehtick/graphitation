@@ -352,10 +352,15 @@ export function resolveListItemChunk(
 ): CompositeValueChunk {
   let parentInfo = chunk.itemChunks[index];
   if (!parentInfo) {
-    // The following "assert" currently conflicts with "extract" which mixes data from multiple layers
-    //   (so the same logical array may contain chunks of different lengths, which is incorrect)
-    // TODO: rework the logic in `extract` and then enable this (and tests)
-    //   assert(0 <= index && index < chunk.data.length);
+    if (index < 0 || index >= chunk.data.length) {
+      // Out of range: a malformed payload repeated the same node with different list
+      // lengths, so a longer chunk's indices reached this shorter one. Returning an
+      // undefined chunk without caching it keeps `itemChunks` from growing holes.
+      return CreateValue.createCompositeUndefinedChunk(
+        chunk.operation,
+        chunk.possibleSelections,
+      );
+    }
     const chunkValue = CreateValue.createCompositeValueChunk(
       chunk.operation,
       chunk.possibleSelections,

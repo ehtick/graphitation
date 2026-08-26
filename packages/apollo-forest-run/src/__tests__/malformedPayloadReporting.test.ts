@@ -68,8 +68,10 @@ test("degrades instead of throwing when path resolution fails", () => {
     throw new Error("parent lookup exploded");
   });
 
+  const warn = jest.fn();
   const cache = new ForestRun({
     typePolicies: { ParticipantEdge: { keyFields: ["cursor"] } },
+    logger: { ...console, warn },
   });
   cache.write({
     query: seedQuery,
@@ -86,19 +88,98 @@ test("degrades instead of throwing when path resolution fails", () => {
     messages: [message([])],
   };
 
-  let error: Error | undefined;
-  try {
-    // The second write recycles the chunk corrupted by the first one, which is when the hole
-    // left behind by the divergent lengths is finally dereferenced.
-    cache.write({ query: feedQuery, result: { feed } });
-    cache.write({ query: feedQuery, result: { feed } });
-  } catch (e) {
-    error = e as Error;
+  cache.write({ query: feedQuery, result: { feed } });
+
+  // `resolveListItemChunk` no longer grows `itemChunks` past `data.length`, so the hole
+  // is punched directly here: other writers (convert.ts, indexTree.ts, delete.ts) can
+  // still produce one, so the reporting path stays worth covering.
+  punchHole(cache);
+
+  // Recycling is when the hole is finally dereferenced. It must not throw: rejecting
+  // this write would reject every later one, since each recycle finds the hole again.
+  expect(() =>
+    cache.write({ query: feedQuery, result: { feed } }),
+  ).not.toThrow();
+
+  // The report still surfaces, degraded to what can be read off the damaged chunk, and
+  // names the underlying failure rather than swallowing it.
+  const reported = warn.mock.calls.flat().join("\n");
+  expect(reported).toContain("malformed payload");
+  expect(reported).toContain("reporting failed: parent lookup exploded");
+});
+
+test("reports a malformed list without rejecting later writes", () => {
+  const warn = jest.fn();
+  const cache = new ForestRun({
+    typePolicies: { ParticipantEdge: { keyFields: ["cursor"] } },
+    logger: { ...console, warn },
+  });
+
+  const feedWith = (edges: unknown[]) => ({
+    __typename: "Feed",
+    id: "feed-1",
+    lastMessage: { ...message(edges), subject: "subject" },
+    messages: [message(edges)],
+  });
+
+  const feed = feedWith([edge("a")]);
+  cache.write({ query: feedQuery, result: { feed } });
+  punchHole(cache);
+
+  // Recycling the damaged chunk is when the hole is finally dereferenced. Throwing
+  // here rejected this write *and every later one*, since each recycle found it again.
+  expect(() =>
+    cache.write({ query: feedQuery, result: { feed } }),
+  ).not.toThrow();
+
+  // The payload is reported instead.
+  expect(warn.mock.calls.flat().join("\n")).toContain("malformed payload");
+
+  for (const cursors of [["a", "b"], ["a", "b", "c"], ["d"]]) {
+    expect(() =>
+      cache.write({
+        query: feedQuery,
+        result: { feed: feedWith(cursors.map(edge)) },
+      }),
+    ).not.toThrow();
   }
 
-  // The invariant is still what surfaces, degraded to what can be read off the damaged chunk
-  // itself. The underlying failure is named rather than swallowed, so telemetry can tell a
-  // broken description apart from a payload that genuinely has nothing more to report.
-  expect(error?.message).toContain("malformed payload");
-  expect(error?.message).toContain("reporting failed: parent lookup exploded");
+  // ...and the operation keeps serving the data it was last written with.
+  const diff = cache.diff({ query: feedQuery, optimistic: false });
+  expect(
+    (diff.result as any).feed.lastMessage.summary.participants.edges.map(
+      (e: any) => e.cursor,
+    ),
+  ).toEqual(["d"]);
 });
+
+/** Leaves an unresolved item reference on every list chunk of the feed tree. */
+function punchHole(cache: ForestRun) {
+  const trees = [...(cache as any).store.dataForest.trees.values()];
+  const tree: any = trees.find((t: any) => t.nodes.has("Feed:feed-1"));
+  const seen = new Set<unknown>();
+  const stack: any[] = [...tree.nodes.values()];
+  let damaged = 0;
+  while (stack.length) {
+    const candidate = stack.pop();
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) {
+      continue;
+    }
+    seen.add(candidate);
+    const items = candidate.itemChunks;
+    if (Array.isArray(candidate.data) && Array.isArray(items) && items.length) {
+      // Index `items.length` is now a hole, index `items.length + 1` is not.
+      items[items.length + 1] = items[0];
+      damaged++;
+      continue;
+    }
+    const values =
+      candidate instanceof Map
+        ? candidate.values()
+        : Object.values(candidate as object);
+    for (const value of values) {
+      if (value && typeof value === "object") stack.push(value);
+    }
+  }
+  expect(damaged).toBeGreaterThan(0);
+}
