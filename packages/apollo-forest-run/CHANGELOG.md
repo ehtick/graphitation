@@ -1,8 +1,16 @@
 # Change Log - @graphitation/apollo-forest-run
 
-<!-- This log was last generated on Tue, 25 Aug 2026 13:33:47 GMT and should not be manually modified. -->
+<!-- This log was last generated on Wed, 26 Aug 2026 17:08:34 GMT and should not be manually modified. -->
 
 <!-- Start content -->
+
+## 0.25.5
+
+Wed, 26 Aug 2026 17:08:34 GMT
+
+### Patches
+
+- fix(apollo-forest-run): resolve out-of-range list items to an undefined chunk instead of caching a hole (vrazuvaev@microsoft.com_msteamsmdb)
 
 ## 0.25.4
 
