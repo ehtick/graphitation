@@ -5,27 +5,48 @@ export function mergeResolvers(
   accumulator: Resolvers,
   resolvers: (Resolvers | Resolvers[])[],
 ): Resolvers {
+  return mergeResolversRecursive(accumulator, resolvers, new Set());
+}
+
+function mergeResolversRecursive(
+  accumulator: Resolvers,
+  resolvers: (Resolvers | Resolvers[])[],
+  owned: Set<string>,
+): Resolvers {
   for (const entry of resolvers) {
     if (Array.isArray(entry)) {
-      mergeResolvers(accumulator, entry);
+      mergeResolversRecursive(accumulator, entry, owned);
     } else {
-      mergeResolversObjMap(accumulator, entry);
+      mergeResolversObjMap(accumulator, entry, owned);
     }
   }
   return accumulator;
 }
 
-function mergeResolversObjMap(accumulator: Resolvers, resolvers: Resolvers) {
+function mergeResolversObjMap(
+  accumulator: Resolvers,
+  resolvers: Resolvers,
+  owned: Set<string>,
+) {
   for (const [typeName, typeResolver] of Object.entries(resolvers)) {
-    if (!isObjectLike(typeResolver)) {
-      if (typeof accumulator[typeName] === "undefined") {
+    const existing = accumulator[typeName];
+    if (existing === undefined) {
+      if (typeResolver) {
         accumulator[typeName] = typeResolver;
       }
       continue;
     }
 
-    if (typeof accumulator[typeName] === "undefined") {
-      accumulator[typeName] = {};
+    if (!isObjectLike(existing) || !isObjectLike(typeResolver)) {
+      continue;
+    }
+
+    if (!owned.has(typeName)) {
+      accumulator[typeName] = Object.assign(
+        Object.create(Object.getPrototypeOf(existing)),
+        existing,
+      );
+      owned.add(typeName);
     }
 
     Object.assign(accumulator[typeName], typeResolver);
