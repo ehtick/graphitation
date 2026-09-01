@@ -17,13 +17,17 @@ export function mergeResolvers(
 
 function mergeResolversObjMap(accumulator: Resolvers, resolvers: Resolvers) {
   for (const [typeName, typeResolver] of Object.entries(resolvers)) {
-    const fullTypeResolver = accumulator[typeName];
-    if (typeof fullTypeResolver === "undefined" && typeResolver) {
-      accumulator[typeName] = typeResolver;
+    if (!isObjectLike(typeResolver)) {
+      if (typeof accumulator[typeName] === "undefined") {
+        accumulator[typeName] = typeResolver;
+      }
       continue;
     }
-    if (isObjectLike(fullTypeResolver) && isObjectLike(typeResolver)) {
-      Object.assign(accumulator[typeName], typeResolver);
+
+    if (typeof accumulator[typeName] === "undefined") {
+      accumulator[typeName] = {};
     }
+
+    Object.assign(accumulator[typeName], typeResolver);
   }
 }
