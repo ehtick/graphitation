@@ -117,4 +117,42 @@ describe("mergeResolvers", () => {
     expect((mergedResolvers2.MyObjectType as ObjectTypeResolver).foo).toBe(foo);
     expect((mergedResolvers3.MyObjectType as ObjectTypeResolver).foo).toBe(foo);
   });
+
+  it("does not mutate or reuse nested objects from resolver maps", () => {
+    const firstUserResolver = () => ({ name: "John" });
+    const secondUserResolver = () => ({ age: 30 });
+    const firstResolvers = {
+      Query: { user: firstUserResolver },
+      Chat: { with: () => ({ name: "John" }) },
+    };
+    const secondResolvers = {
+      Query: { user: secondUserResolver },
+      Chat: { title: () => "Chat" },
+    };
+
+    const mergedResolvers = mergeResolvers({}, [
+      firstResolvers,
+      secondResolvers,
+    ]);
+
+    expect(mergedResolvers).toEqual({
+      Query: { user: secondUserResolver },
+      Chat: {
+        with: firstResolvers.Chat.with,
+        title: secondResolvers.Chat.title,
+      },
+    });
+    expect(firstResolvers).toEqual({
+      Query: { user: firstUserResolver },
+      Chat: { with: firstResolvers.Chat.with },
+    });
+    expect(secondResolvers).toEqual({
+      Query: { user: secondUserResolver },
+      Chat: { title: secondResolvers.Chat.title },
+    });
+    expect(mergedResolvers.Query).not.toBe(firstResolvers.Query);
+    expect(mergedResolvers.Query).not.toBe(secondResolvers.Query);
+    expect(mergedResolvers.Chat).not.toBe(firstResolvers.Chat);
+    expect(mergedResolvers.Chat).not.toBe(secondResolvers.Chat);
+  });
 });
