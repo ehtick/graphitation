@@ -1,7 +1,0 @@
-{
-  "type": "minor",
-  "comment": "feat: do not mutate nested objects on resolver merge",
-  "packageName": "@graphitation/supermassive",
-  "email": "dsamsonov@microsoft.com",
-  "dependentChangeType": "patch"
-}
